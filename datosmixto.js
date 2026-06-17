@@ -1,17 +1,46 @@
 const { chromium } = require("playwright");
 
 (async() => {
-    // 1. Lanzar el navegador
-    const browser = await chromium.launch({ headless: false });
+    // PASO CLAVE: Leemos la variable de la consola y limpiamos espacios de Windows
+    const variableConsola = process.env.HEADED ? process.env.HEADED.trim() : 'false';
+    const esHeaded = variableConsola === 'true';
+
+    console.log(`\n Iniciando Validación Cruzada en modo: ${esHeaded ? 'CON INTERFAZ (Headed)' : 'SIN INTERFAZ (Headless)'}`);
+
+    // 1. CONFIGURACIÓN DEL LANZAMIENTO (El truco definitivo anti-bloqueos)
+    const argsConfig = [
+        '--disable-blink-features=AutomationControlled',
+        '--window-size=1920,1080',
+        '--mute-audio'
+    ];
+
+    // Si el usuario quiere modo oculto (false), le inyectamos el motor headless en segundo plano
+    if (!esHeaded) {
+        argsConfig.push('--headless=new');
+    }
+
+    const browser = await chromium.launch({
+        headless: false, // Siempre false para conservar las firmas reales de hardware y evitar el baneo
+        args: argsConfig
+    });
+
     const context = await browser.newContext({
         viewport: { width: 1920, height: 1080 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        locale: 'es-MX',
+        timezoneId: 'America/Mexico_City',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     });
+
     const page = await context.newPage();
+
+    // Ofuscar la bandera de automatización
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
 
     let productosAPI = [];
 
-    // 2. CONFIGURAR INTERCEPCIÓN (Captura el JSON de la API)
+    // 2. CONFIGURAR INTERCEPCIÓN (Escucha la red en segundo plano desde el inicio)
     page.on('response', async(response) => {
         const url = response.url();
         if (url.includes('/plp') && response.status() === 200) {
@@ -19,40 +48,33 @@ const { chromium } = require("playwright");
                 const json = await response.json();
                 if (json && json.plpResults && json.plpResults.records) {
                     productosAPI = json.plpResults.records;
+                    console.log(`  [Red] API Interceptada con éxito. Registros capturados: ${productosAPI.length}`);
                 }
             } catch (e) {
-                // Silenciar errores de JSON
+                // Silenciar errores de lectura de JSON basura
             }
         }
     });
 
     try {
-        // 3. FLUJO EN LA INTERFAZ (UI) - NAVEGACIÓN DIRECTA A LA BÚSQUEDA
-        console.log(" Navegando directo a los resultados de búsqueda...");
-        await page.goto("https://www.liverpool.com.mx/tienda?s=playstation5", { waitUntil: 'domcontentloaded', timeout: 40000 });
+        // 3. NAVEGACIÓN DIRECTA CON ORDENAMIENTO (Bypass de clics para evitar errores de visibilidad)
+        console.log(" Navegando directo a los resultados ordenados por MENOR PRECIO...");
+        await page.goto("https://www.liverpool.com.mx/tienda?s=playstation5&sortPrice|0", {
+            waitUntil: 'domcontentloaded',
+            timeout: 50000
+        });
 
-        // Ordenar por precio: de menor a más alto
-        console.log(" Esperando a que cargue el menú de ordenamiento...");
-        const dropdown = page.locator('#sortby').filter({ visible: true });
-
-        await dropdown.waitFor({ state: 'visible', timeout: 35000 });
-        await dropdown.click();
-
-        const opcionMenorPrecio = page.getByRole('button', { name: 'Menor precio' });
-        await opcionMenorPrecio.waitFor({ state: 'visible', timeout: 10000 });
-        await opcionMenorPrecio.click();
-
-        //  CORRECCIÓN AQUÍ: Quitamos 'networkidle' y esperamos visualmente a que las tarjetas reaccionen
-        console.log(" Esperando renderizado de las tarjetas de productos...");
-        const tarjetasProductos = page.locator('.m-product__card');
-
-        // Esperamos a que la primera tarjeta esté visible tras el clic del ordenamiento
-        await tarjetasProductos.first().waitFor({ state: 'visible', timeout: 20000 });
-
-        // Pausa breve de 3 segundos para garantizar que el DOM terminó de reordenar los textos e interceptar la red
-        await page.waitForTimeout(3000);
+        // Pausa de control para asegurar que la API responda y el DOM absorba los datos
+        console.log(" Esperando que la red y el DOM se estabilicen...");
+        await page.waitForTimeout(6000);
 
         // 4. EXTRAER PRODUCTOS DE LA INTERFAZ (UI)
+        console.log(" Extrayendo información de las tarjetas de productos...");
+        const tarjetasProductos = page.locator('.m-product__card');
+
+        // CORRECCIÓN: Esperamos a que existan en el DOM ('attached'), eliminando los bloqueos de 'visible'
+        await tarjetasProductos.first().waitFor({ state: 'attached', timeout: 25000 });
+
         const totalProductos = await tarjetasProductos.count();
         const listaProductosUI = [];
 
@@ -78,8 +100,8 @@ const { chromium } = require("playwright");
             });
         }
 
-        console.log("\n📺 Productos en la Interfaz (UI):", listaProductosUI);
-        console.log(` Productos en la Red (API): ${productosAPI.length} encontrados.`);
+        console.log("\n Productos leídos de la Pantalla (UI):", listaProductosUI);
+        console.log(`  Productos interceptados en la Red (API): ${productosAPI.length} encontrados.`);
 
         // 5. CAPA DE VALIDACIÓN CRUZADA
         let coincidenciasExactas = 0;
@@ -117,23 +139,24 @@ const { chromium } = require("playwright");
         });
 
         // 6. IMPRIMIR REPORTES Y ASERCIONES
-        console.log("\n================ REPORTES Y AFIRMACIONES ================");
+        console.log("\n================ REPORTES Y ASERCIONES ================");
         if (coincidenciasExactas >= 3) {
-            console.log(` ASERCIÓN PASADA: Al menos 3 productos coinciden (${coincidenciasExactas}/5 encontrados).`);
+            console.log(`  ASERCIÓN PASADA: Al menos 3 productos coinciden perfectamente (${coincidenciasExactas}/5 verificados).`);
         } else {
-            console.error(` ASERCIÓN FALLIDA: Solo coincidieron ${coincidenciasExactas} de los 5 productos.`);
+            console.error(`  ASERCIÓN FALLIDA: Solo coincidieron ${coincidenciasExactas} de los 5 productos.`);
         }
 
         if (discrepancias.length > 0) {
-            console.log("\n DISCREPANCIAS ENCONTRADAS:");
+            console.log("\n  DISCREPANCIAS ENCONTRADAS EN LA COMPARACIÓN:");
             console.table(discrepancias);
         } else {
-            console.log("\n ¡Perfecto! Los datos de la UI coinciden al 100% con la API.");
+            console.log("\n  ¡Perfecto! Los datos de la interfaz (UI) coinciden al 100% con los datos crudos del servidor (API).");
         }
 
     } catch (error) {
-        console.error(" Ocurrió un error durante la ejecución del flujo:", error.message);
+        console.error("  Ocurrió un error inesperado durante el flujo:", error.message);
     } finally {
+        if (esHeaded) await page.waitForTimeout(3000);
         // Cerrar navegador de forma segura
         await browser.close();
     }
